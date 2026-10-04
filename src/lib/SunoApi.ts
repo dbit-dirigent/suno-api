@@ -547,11 +547,33 @@ class SunoApi {
   }
 
   private async captchaRequired(): Promise<boolean> {
+    return (await this.captchaCheck()).required;
+  }
+
+  /**
+   * Suno's own CAPTCHA check. Since ~2026-10 it answers `captcha_version: 2`, and the create page
+   * shows a Cloudflare Turnstile checkbox instead of the hCaptcha puzzle the browser flow below expects.
+   */
+  private async captchaCheck(): Promise<{ required: boolean; version: number | null }> {
     const resp = await this.client.post(`${SunoApi.BASE_URL}/api/c/check`, {
       ctype: 'generation'
     });
     logger.debug('CAPTCHA check response', sanitize(resp.data));
-    return resp.data.required;
+    return { required: !!resp.data.required, version: resp.data.captcha_version ?? null };
+  }
+
+  /**
+   * Turnstile path: no browser. 2Captcha solves the widget from its sitekey and page URL and returns
+   * the token the create page would put in the generate request (verified 2026-10-04: accepted by
+   * /api/generate/v2/). Sitekey from SUNO_TURNSTILE_SITEKEY, default = the one on suno.com/create.
+   */
+  private async solveTurnstile(): Promise<string> {
+    const sitekey = process.env.SUNO_TURNSTILE_SITEKEY || '0x4AAAAAADI7xDNyj-3LcIbi';
+    logger.info('Solving Cloudflare Turnstile via 2Captcha...');
+    const res = await this.solver.cloudflareTurnstile({ pageurl: 'https://suno.com/create', sitekey });
+    if (!res?.data) throw new Error('2Captcha returned no Turnstile token');
+    logger.info('Turnstile token received');
+    return res.data;
   }
 
   /**
@@ -838,6 +860,19 @@ class SunoApi {
    * ```
    */
   public async getCaptcha(): Promise<string|null> {
+    // Turnstile first (Suno's current challenge); the hCaptcha browser flow below stays as fallback.
+    try {
+      const check = await this.captchaCheck();
+      if (!check.required) {
+        logger.info('CAPTCHA not required for this generation');
+        return null;
+      }
+      if (check.version === 2 || (process.env.SUNO_CAPTCHA || '').toLowerCase() === 'turnstile') {
+        return await this.solveTurnstile();
+      }
+    } catch (e) {
+      logger.warn(`Turnstile path failed, falling back to the browser flow: ${toError(e).message}`);
+    }
     const browser = await this.launchBrowser();
     const page = await browser.newPage();
 
